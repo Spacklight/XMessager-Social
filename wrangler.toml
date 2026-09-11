@@ -1,0 +1,11 @@
+name = "xmessager-social"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "xmessager-social-db"
+database_id = "e0071c40-ff9a-498e-9385-199663834123"
+
+[vars]
+HF_MEDIA_REPO = "Spacklight/Social-Media"
