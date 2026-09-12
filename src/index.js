@@ -101,6 +101,15 @@ export default {
       mm = m(/^\/api\/pages\/([a-f0-9-]+)\/posts\/([a-f0-9-]+)\/share$/);
       if (mm && request.method === "POST") return await sharePost(mm[1], mm[2], request, env, cors);
 
+      if (p === "/api/presence" && request.method === "POST") return await updatePresence(request, env, cors);
+      mm = m(/^\/api\/presence\/([a-f0-9-]+)$/);
+      if (mm && request.method === "GET") return await getPresence(mm[1], request, env, cors);
+
+      if (p === "/api/notifications" && request.method === "GET") return await listNotifications(request, env, cors);
+      mm = m(/^\/api\/notifications\/([a-f0-9-]+)\/read$/);
+      if (mm && request.method === "POST") return await markNotificationRead(mm[1], request, env, cors);
+      if (p === "/api/notifications/read-all" && request.method === "POST") return await markAllNotificationsRead(request, env, cors);
+
       return json({ error: "Not found" }, 404, cors);
     } catch (err) {
       return json({ error: err.message || "Internal error" }, 500, cors);
@@ -336,6 +345,7 @@ async function inviteToGroup(groupId, request, env, cors) {
   const existing = await getGroupMembership(env.DB, groupId, targetUserId);
   if (existing) return json({ ok: true, already_member: true }, 200, cors);
   await env.DB.prepare(`INSERT INTO group_members (group_id,user_id,role,joined_at) VALUES (?,?,?,?)`).bind(groupId, targetUserId, "member", Date.now()).run();
+  await createNotification(env, targetUserId, "group_invite", `You were added to the group "${group.name}"`, `group.html?id=${groupId}`);
   return json({ ok: true }, 200, cors);
 }
 
@@ -547,6 +557,8 @@ async function postChatMessage(chatId, request, env, cors) {
   await env.DB.prepare(
     `INSERT INTO chat_messages (id,chat_id,sender_id,content,media_url,media_type,continent,region,country,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)`
   ).bind(id, chatId, user.id, content, mediaUrl, mediaType, loc.continent, loc.region, loc.country, createdAt).run();
+  const recipientId = chat.user_a === user.id ? chat.user_b : chat.user_a;
+  await createNotification(env, recipientId, "chat_message", `${user.display_name}: ${content ? content.slice(0,60) : "sent an attachment"}`, `chat.html?id=${chatId}`);
   return json({ id, chat_id: chatId, sender_id: user.id, content, media_url: mediaUrl, media_type: mediaType, created_at: createdAt }, 200, cors);
 }
 
@@ -659,6 +671,9 @@ async function togglePostLike(pageId, postId, request, env, cors) {
   } else {
     await env.DB.prepare(`INSERT INTO page_post_likes (post_id, user_id, created_at) VALUES (?,?,?)`).bind(postId, user.id, Date.now()).run();
   }
+  if (!existing && post.author_id !== user.id) {
+    await createNotification(env, post.author_id, "post_like", `${user.display_name} liked your post`, `page.html?id=${pageId}`);
+  }
   const countRow = await env.DB.prepare(`SELECT COUNT(*) as c FROM page_post_likes WHERE post_id=?`).bind(postId).first();
   return json({ liked: !existing, like_count: countRow.c }, 200, cors);
 }
@@ -685,6 +700,9 @@ async function addPostComment(pageId, postId, request, env, cors) {
   const createdAt = Date.now();
   await env.DB.prepare(`INSERT INTO page_post_comments (id, post_id, user_id, content, created_at) VALUES (?,?,?,?,?)`)
     .bind(id, postId, user.id, content, createdAt).run();
+  if (post.author_id !== user.id) {
+    await createNotification(env, post.author_id, "post_comment", `${user.display_name} commented: ${content.slice(0,60)}`, `page.html?id=${pageId}`);
+  }
   return json({ id, post_id: postId, user_id: user.id, display_name: user.display_name, content, created_at: createdAt }, 200, cors);
 }
 
@@ -713,6 +731,56 @@ async function invitePage(pageId, request, env, cors) {
   const existing = await isFollower(env.DB, pageId, targetUserId);
   if (existing) return json({ ok: true, already_following: true }, 200, cors);
   await env.DB.prepare(`INSERT INTO page_followers (page_id,user_id,followed_at) VALUES (?,?,?)`).bind(pageId, targetUserId, Date.now()).run();
+  await createNotification(env, targetUserId, "page_invite", `You were invited to follow the page "${page.name}"`, `page.html?id=${pageId}`);
+  return json({ ok: true }, 200, cors);
+}
+
+async function createNotification(env, userId, type, message, link) {
+  try {
+    await env.DB.prepare(`INSERT INTO notifications (id,user_id,type,message,link,is_read,created_at) VALUES (?,?,?,?,?,0,?)`)
+      .bind(crypto.randomUUID(), userId, type, message, link, Date.now()).run();
+  } catch (_) {}
+}
+
+async function updatePresence(request, env, cors) {
+  const user = await requireAuth(request, env);
+  if (!user) return json({ error: "Unauthorized" }, 401, cors);
+  const body = await request.json();
+  const status = ["online", "typing", "recording"].includes(body.status) ? body.status : "online";
+  const contextId = body.context_id || null;
+  await env.DB.prepare(
+    `INSERT INTO presence (user_id, status, context_id, updated_at) VALUES (?,?,?,?)
+     ON CONFLICT(user_id) DO UPDATE SET status=excluded.status, context_id=excluded.context_id, updated_at=excluded.updated_at`
+  ).bind(user.id, status, contextId, Date.now()).run();
+  return json({ ok: true }, 200, cors);
+}
+
+async function getPresence(userId, request, env, cors) {
+  const user = await requireAuth(request, env);
+  if (!user) return json({ error: "Unauthorized" }, 401, cors);
+  const row = await env.DB.prepare(`SELECT status, context_id, updated_at FROM presence WHERE user_id=?`).bind(userId).first();
+  return json(row || { status: "offline", context_id: null, updated_at: 0 }, 200, cors);
+}
+
+async function listNotifications(request, env, cors) {
+  const user = await requireAuth(request, env);
+  if (!user) return json({ error: "Unauthorized" }, 401, cors);
+  const { results } = await env.DB.prepare(`SELECT * FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 50`).bind(user.id).all();
+  const unread = results.filter(n => !n.is_read).length;
+  return json({ notifications: results, unread_count: unread }, 200, cors);
+}
+
+async function markNotificationRead(id, request, env, cors) {
+  const user = await requireAuth(request, env);
+  if (!user) return json({ error: "Unauthorized" }, 401, cors);
+  await env.DB.prepare(`UPDATE notifications SET is_read=1 WHERE id=? AND user_id=?`).bind(id, user.id).run();
+  return json({ ok: true }, 200, cors);
+}
+
+async function markAllNotificationsRead(request, env, cors) {
+  const user = await requireAuth(request, env);
+  if (!user) return json({ error: "Unauthorized" }, 401, cors);
+  await env.DB.prepare(`UPDATE notifications SET is_read=1 WHERE user_id=?`).bind(user.id).run();
   return json({ ok: true }, 200, cors);
 }
 
