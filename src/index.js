@@ -82,6 +82,25 @@ export default {
       if (mm && request.method === "POST") return await postChatMessage(mm[1], request, env, cors);
       if (mm && request.method === "GET") return await listChatMessages(mm[1], request, env, cors);
 
+      mm = m(/^\/api\/groups\/([a-f0-9-]+)\/settings$/);
+      if (mm && request.method === "POST") return await updateGroupSettings(mm[1], request, env, cors);
+      mm = m(/^\/api\/groups\/([a-f0-9-]+)\/delete$/);
+      if (mm && request.method === "POST") return await deleteGroup(mm[1], request, env, cors);
+
+      mm = m(/^\/api\/pages\/([a-f0-9-]+)\/settings$/);
+      if (mm && request.method === "POST") return await updatePageSettings(mm[1], request, env, cors);
+      mm = m(/^\/api\/pages\/([a-f0-9-]+)\/delete$/);
+      if (mm && request.method === "POST") return await deletePage(mm[1], request, env, cors);
+      mm = m(/^\/api\/pages\/([a-f0-9-]+)\/invite$/);
+      if (mm && request.method === "POST") return await invitePage(mm[1], request, env, cors);
+      mm = m(/^\/api\/pages\/([a-f0-9-]+)\/posts\/([a-f0-9-]+)\/like$/);
+      if (mm && request.method === "POST") return await togglePostLike(mm[1], mm[2], request, env, cors);
+      mm = m(/^\/api\/pages\/([a-f0-9-]+)\/posts\/([a-f0-9-]+)\/comments$/);
+      if (mm && request.method === "GET") return await listPostComments(mm[1], mm[2], request, env, cors);
+      if (mm && request.method === "POST") return await addPostComment(mm[1], mm[2], request, env, cors);
+      mm = m(/^\/api\/pages\/([a-f0-9-]+)\/posts\/([a-f0-9-]+)\/share$/);
+      if (mm && request.method === "POST") return await sharePost(mm[1], mm[2], request, env, cors);
+
       return json({ error: "Not found" }, 404, cors);
     } catch (err) {
       return json({ error: err.message || "Internal error" }, 500, cors);
@@ -258,9 +277,10 @@ async function listGroups(request, env, cors) {
   if (!user) return json({ error: "Unauthorized" }, 401, cors);
   const url = new URL(request.url);
   const continent = url.searchParams.get("continent");
+  const cols = "id,name,description,visibility,owner_id,picture_url,post_permission,posts_enabled,continent,region,country";
   const stmt = continent
-    ? env.DB.prepare(`SELECT id,name,description,visibility,owner_id,continent,region,country FROM groups WHERE visibility='public' AND continent=? ORDER BY created_at DESC LIMIT 50`).bind(continent)
-    : env.DB.prepare(`SELECT id,name,description,visibility,owner_id,continent,region,country FROM groups WHERE visibility='public' ORDER BY created_at DESC LIMIT 50`);
+    ? env.DB.prepare(`SELECT ${cols} FROM groups WHERE visibility='public' AND continent=? ORDER BY created_at DESC LIMIT 50`).bind(continent)
+    : env.DB.prepare(`SELECT ${cols} FROM groups WHERE visibility='public' ORDER BY created_at DESC LIMIT 50`);
   const { results } = await stmt.all();
   return json({ groups: results }, 200, cors);
 }
@@ -322,8 +342,14 @@ async function inviteToGroup(groupId, request, env, cors) {
 async function postGroupMessage(groupId, request, env, cors) {
   const user = await requireAuth(request, env);
   if (!user) return json({ error: "Unauthorized" }, 401, cors);
+  const group = await env.DB.prepare(`SELECT * FROM groups WHERE id=?`).bind(groupId).first();
+  if (!group) return json({ error: "Group not found" }, 404, cors);
   const member = await getGroupMembership(env.DB, groupId, user.id);
   if (!member) return json({ error: "You must be a member of this group to post" }, 403, cors);
+  if (!group.posts_enabled) return json({ error: "Posting is currently disabled in this group" }, 403, cors);
+  if (group.post_permission === "owner_only" && group.owner_id !== user.id) {
+    return json({ error: "Only the group owner can post right now" }, 403, cors);
+  }
   const body = await request.json();
   const content = (body.content || "").toString();
   const mediaUrl = body.media_url || null;
@@ -373,9 +399,10 @@ async function listPages(request, env, cors) {
   if (!user) return json({ error: "Unauthorized" }, 401, cors);
   const url = new URL(request.url);
   const continent = url.searchParams.get("continent");
+  const cols = "id,name,description,visibility,owner_id,profile_picture_url,post_permission,posts_enabled,continent,region,country";
   const stmt = continent
-    ? env.DB.prepare(`SELECT id,name,description,visibility,owner_id,continent,region,country FROM pages WHERE visibility='public' AND continent=? ORDER BY created_at DESC LIMIT 50`).bind(continent)
-    : env.DB.prepare(`SELECT id,name,description,visibility,owner_id,continent,region,country FROM pages WHERE visibility='public' ORDER BY created_at DESC LIMIT 50`);
+    ? env.DB.prepare(`SELECT ${cols} FROM pages WHERE visibility='public' AND continent=? ORDER BY created_at DESC LIMIT 50`).bind(continent)
+    : env.DB.prepare(`SELECT ${cols} FROM pages WHERE visibility='public' ORDER BY created_at DESC LIMIT 50`);
   const { results } = await stmt.all();
   return json({ pages: results }, 200, cors);
 }
@@ -421,7 +448,15 @@ async function postPagePost(pageId, request, env, cors) {
   if (!user) return json({ error: "Unauthorized" }, 401, cors);
   const page = await env.DB.prepare(`SELECT * FROM pages WHERE id=?`).bind(pageId).first();
   if (!page) return json({ error: "Page not found" }, 404, cors);
-  if (page.owner_id !== user.id) return json({ error: "Only the page owner can post" }, 403, cors);
+  if (!page.posts_enabled) return json({ error: "Posting is currently disabled on this page" }, 403, cors);
+  const isOwnerPosting = page.owner_id === user.id;
+  if (page.post_permission === "owner_only" && !isOwnerPosting) {
+    return json({ error: "Only the page owner can post" }, 403, cors);
+  }
+  if (page.post_permission === "followers" && !isOwnerPosting) {
+    const follower = await isFollower(env.DB, pageId, user.id);
+    if (!follower) return json({ error: "Only followers can post on this page" }, 403, cors);
+  }
   const body = await request.json();
   const content = (body.content || "").toString();
   const mediaUrl = body.media_url || null;
@@ -445,7 +480,13 @@ async function listPagePosts(pageId, request, env, cors) {
     const follower = await isFollower(env.DB, pageId, user.id);
     if (!follower) return json({ error: "This page is private" }, 403, cors);
   }
-  const { results } = await env.DB.prepare(`SELECT * FROM page_posts WHERE page_id=? ORDER BY created_at DESC LIMIT 50`).bind(pageId).all();
+  const { results } = await env.DB.prepare(
+    `SELECT p.*,
+      (SELECT COUNT(*) FROM page_post_likes l WHERE l.post_id=p.id) as like_count,
+      (SELECT COUNT(*) FROM page_post_comments c WHERE c.post_id=p.id) as comment_count,
+      (SELECT COUNT(*) FROM page_post_likes l2 WHERE l2.post_id=p.id AND l2.user_id=?) as liked_by_me
+     FROM page_posts p WHERE p.page_id=? ORDER BY p.created_at DESC LIMIT 50`
+  ).bind(user.id, pageId).all();
   return json({ posts: results, page }, 200, cors);
 }
 
@@ -535,6 +576,144 @@ async function handleUpdateMe(request, env, cors) {
   ).bind(displayName, bio, profilePictureUrl, user.id).run();
 
   return json({ id: user.id, email: user.email, display_name: displayName, bio, profile_picture_url: profilePictureUrl }, 200, cors);
+}
+
+async function updateGroupSettings(groupId, request, env, cors) {
+  const user = await requireAuth(request, env);
+  if (!user) return json({ error: "Unauthorized" }, 401, cors);
+  const group = await env.DB.prepare(`SELECT * FROM groups WHERE id=?`).bind(groupId).first();
+  if (!group) return json({ error: "Group not found" }, 404, cors);
+  if (group.owner_id !== user.id) return json({ error: "Only the group owner can change settings" }, 403, cors);
+  const body = await request.json();
+  const name = body.name !== undefined ? body.name.trim() : group.name;
+  const description = body.description !== undefined ? body.description : group.description;
+  const visibility = body.visibility === "private" ? "private" : body.visibility === "public" ? "public" : group.visibility;
+  const pictureUrl = body.picture_url !== undefined ? body.picture_url : group.picture_url;
+  const postPermission = body.post_permission === "owner_only" ? "owner_only" : body.post_permission === "members" ? "members" : group.post_permission;
+  const postsEnabled = body.posts_enabled !== undefined ? (body.posts_enabled ? 1 : 0) : group.posts_enabled;
+  if (!name) return json({ error: "name cannot be empty" }, 400, cors);
+  await env.DB.prepare(
+    `UPDATE groups SET name=?, description=?, visibility=?, picture_url=?, post_permission=?, posts_enabled=? WHERE id=?`
+  ).bind(name, description, visibility, pictureUrl, postPermission, postsEnabled, groupId).run();
+  return json({ ok: true, id: groupId, name, description, visibility, picture_url: pictureUrl, post_permission: postPermission, posts_enabled: postsEnabled }, 200, cors);
+}
+
+async function deleteGroup(groupId, request, env, cors) {
+  const user = await requireAuth(request, env);
+  if (!user) return json({ error: "Unauthorized" }, 401, cors);
+  const group = await env.DB.prepare(`SELECT * FROM groups WHERE id=?`).bind(groupId).first();
+  if (!group) return json({ error: "Group not found" }, 404, cors);
+  if (group.owner_id !== user.id) return json({ error: "Only the group owner can delete this group" }, 403, cors);
+  await env.DB.batch([
+    env.DB.prepare(`DELETE FROM group_messages WHERE group_id=?`).bind(groupId),
+    env.DB.prepare(`DELETE FROM group_members WHERE group_id=?`).bind(groupId),
+    env.DB.prepare(`DELETE FROM groups WHERE id=?`).bind(groupId),
+  ]);
+  return json({ ok: true }, 200, cors);
+}
+
+async function updatePageSettings(pageId, request, env, cors) {
+  const user = await requireAuth(request, env);
+  if (!user) return json({ error: "Unauthorized" }, 401, cors);
+  const page = await env.DB.prepare(`SELECT * FROM pages WHERE id=?`).bind(pageId).first();
+  if (!page) return json({ error: "Page not found" }, 404, cors);
+  if (page.owner_id !== user.id) return json({ error: "Only the page owner can change settings" }, 403, cors);
+  const body = await request.json();
+  const name = body.name !== undefined ? body.name.trim() : page.name;
+  const description = body.description !== undefined ? body.description : page.description;
+  const visibility = body.visibility === "private" ? "private" : body.visibility === "public" ? "public" : page.visibility;
+  const pictureUrl = body.profile_picture_url !== undefined ? body.profile_picture_url : page.profile_picture_url;
+  const postPermission = body.post_permission === "owner_only" ? "owner_only" : body.post_permission === "followers" ? "followers" : page.post_permission;
+  const postsEnabled = body.posts_enabled !== undefined ? (body.posts_enabled ? 1 : 0) : page.posts_enabled;
+  if (!name) return json({ error: "name cannot be empty" }, 400, cors);
+  await env.DB.prepare(
+    `UPDATE pages SET name=?, description=?, visibility=?, profile_picture_url=?, post_permission=?, posts_enabled=? WHERE id=?`
+  ).bind(name, description, visibility, pictureUrl, postPermission, postsEnabled, pageId).run();
+  return json({ ok: true, id: pageId, name, description, visibility, profile_picture_url: pictureUrl, post_permission: postPermission, posts_enabled: postsEnabled }, 200, cors);
+}
+
+async function deletePage(pageId, request, env, cors) {
+  const user = await requireAuth(request, env);
+  if (!user) return json({ error: "Unauthorized" }, 401, cors);
+  const page = await env.DB.prepare(`SELECT * FROM pages WHERE id=?`).bind(pageId).first();
+  if (!page) return json({ error: "Page not found" }, 404, cors);
+  if (page.owner_id !== user.id) return json({ error: "Only the page owner can delete this page" }, 403, cors);
+  await env.DB.batch([
+    env.DB.prepare(`DELETE FROM page_post_comments WHERE post_id IN (SELECT id FROM page_posts WHERE page_id=?)`).bind(pageId),
+    env.DB.prepare(`DELETE FROM page_post_likes WHERE post_id IN (SELECT id FROM page_posts WHERE page_id=?)`).bind(pageId),
+    env.DB.prepare(`DELETE FROM page_posts WHERE page_id=?`).bind(pageId),
+    env.DB.prepare(`DELETE FROM page_followers WHERE page_id=?`).bind(pageId),
+    env.DB.prepare(`DELETE FROM pages WHERE id=?`).bind(pageId),
+  ]);
+  return json({ ok: true }, 200, cors);
+}
+
+async function togglePostLike(pageId, postId, request, env, cors) {
+  const user = await requireAuth(request, env);
+  if (!user) return json({ error: "Unauthorized" }, 401, cors);
+  const post = await env.DB.prepare(`SELECT * FROM page_posts WHERE id=? AND page_id=?`).bind(postId, pageId).first();
+  if (!post) return json({ error: "Post not found" }, 404, cors);
+  const existing = await env.DB.prepare(`SELECT * FROM page_post_likes WHERE post_id=? AND user_id=?`).bind(postId, user.id).first();
+  if (existing) {
+    await env.DB.prepare(`DELETE FROM page_post_likes WHERE post_id=? AND user_id=?`).bind(postId, user.id).run();
+  } else {
+    await env.DB.prepare(`INSERT INTO page_post_likes (post_id, user_id, created_at) VALUES (?,?,?)`).bind(postId, user.id, Date.now()).run();
+  }
+  const countRow = await env.DB.prepare(`SELECT COUNT(*) as c FROM page_post_likes WHERE post_id=?`).bind(postId).first();
+  return json({ liked: !existing, like_count: countRow.c }, 200, cors);
+}
+
+async function listPostComments(pageId, postId, request, env, cors) {
+  const user = await requireAuth(request, env);
+  if (!user) return json({ error: "Unauthorized" }, 401, cors);
+  const { results } = await env.DB.prepare(
+    `SELECT c.*, u.display_name, u.profile_picture_url FROM page_post_comments c
+     JOIN users u ON u.id = c.user_id WHERE c.post_id=? ORDER BY c.created_at ASC LIMIT 100`
+  ).bind(postId).all();
+  return json({ comments: results }, 200, cors);
+}
+
+async function addPostComment(pageId, postId, request, env, cors) {
+  const user = await requireAuth(request, env);
+  if (!user) return json({ error: "Unauthorized" }, 401, cors);
+  const post = await env.DB.prepare(`SELECT * FROM page_posts WHERE id=? AND page_id=?`).bind(postId, pageId).first();
+  if (!post) return json({ error: "Post not found" }, 404, cors);
+  const body = await request.json();
+  const content = (body.content || "").trim();
+  if (!content) return json({ error: "content is required" }, 400, cors);
+  const id = crypto.randomUUID();
+  const createdAt = Date.now();
+  await env.DB.prepare(`INSERT INTO page_post_comments (id, post_id, user_id, content, created_at) VALUES (?,?,?,?,?)`)
+    .bind(id, postId, user.id, content, createdAt).run();
+  return json({ id, post_id: postId, user_id: user.id, display_name: user.display_name, content, created_at: createdAt }, 200, cors);
+}
+
+async function sharePost(pageId, postId, request, env, cors) {
+  const user = await requireAuth(request, env);
+  if (!user) return json({ error: "Unauthorized" }, 401, cors);
+  const post = await env.DB.prepare(`SELECT * FROM page_posts WHERE id=? AND page_id=?`).bind(postId, pageId).first();
+  if (!post) return json({ error: "Post not found" }, 404, cors);
+  await env.DB.prepare(`UPDATE page_posts SET share_count = share_count + 1 WHERE id=?`).bind(postId).run();
+  return json({ ok: true }, 200, cors);
+}
+
+async function invitePage(pageId, request, env, cors) {
+  const user = await requireAuth(request, env);
+  if (!user) return json({ error: "Unauthorized" }, 401, cors);
+  const page = await env.DB.prepare(`SELECT * FROM pages WHERE id=?`).bind(pageId).first();
+  if (!page) return json({ error: "Page not found" }, 404, cors);
+  const isOwner = page.owner_id === user.id;
+  if (!isOwner) {
+    const follower = await isFollower(env.DB, pageId, user.id);
+    if (!follower) return json({ error: "Only followers can invite others to this page" }, 403, cors);
+  }
+  const body = await request.json();
+  const targetUserId = body.user_id;
+  if (!targetUserId) return json({ error: "user_id is required" }, 400, cors);
+  const existing = await isFollower(env.DB, pageId, targetUserId);
+  if (existing) return json({ ok: true, already_following: true }, 200, cors);
+  await env.DB.prepare(`INSERT INTO page_followers (page_id,user_id,followed_at) VALUES (?,?,?)`).bind(pageId, targetUserId, Date.now()).run();
+  return json({ ok: true }, 200, cors);
 }
 
 function json(obj, status, cors) {
