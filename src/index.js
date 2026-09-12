@@ -190,7 +190,12 @@ async function handleMediaUpload(request, env, cors) {
   const nameParts = (file.name || "file.bin").split(".");
   const ext = (nameParts.length > 1 ? nameParts.pop() : "bin").toLowerCase();
   const path = `media/${id}.${ext}`;
-  const mediaType = (file.type || "").startsWith("image/") ? "image" : (file.type || "").startsWith("video/") ? "video" : "file";
+  const fileType = file.type || "";
+  const mediaType = fileType.startsWith("image/") ? "image"
+    : fileType.startsWith("video/") ? "video"
+    : fileType.startsWith("audio/") ? "audio"
+    : fileType === "application/pdf" ? "pdf"
+    : "file";
   let oid;
   try { ({ oid } = await uploadViaLfs(env, env.HF_MEDIA_REPO, buf, path)); }
   catch (err) { return json({ error: "Hugging Face LFS upload failed", details: err.message }, 502, cors); }
