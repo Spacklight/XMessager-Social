@@ -44,6 +44,7 @@ export default {
       if (p === "/api/auth/signup" && request.method === "POST") return await handleSignup(request, env, cors);
       if (p === "/api/auth/login" && request.method === "POST") return await handleLogin(request, env, cors);
       if (p === "/api/me" && request.method === "GET") return await handleMe(request, env, cors);
+      if (p === "/api/me" && request.method === "POST") return await handleUpdateMe(request, env, cors);
 
       if (p === "/api/users/search" && request.method === "GET") return await searchUser(request, env, cors);
       let mm = m(/^\/api\/users\/([a-f0-9-]+)$/);
@@ -512,6 +513,23 @@ async function listChatMessages(chatId, request, env, cors) {
   const other = await env.DB.prepare(`SELECT id, display_name, profile_picture_url FROM users WHERE id=?`).bind(otherId).first();
   const { results } = await env.DB.prepare(`SELECT * FROM chat_messages WHERE chat_id=? ORDER BY created_at ASC LIMIT 100`).bind(chatId).all();
   return json({ messages: results, other_user: other }, 200, cors);
+}
+
+async function handleUpdateMe(request, env, cors) {
+  const user = await requireAuth(request, env);
+  if (!user) return json({ error: "Unauthorized" }, 401, cors);
+  const body = await request.json();
+  const displayName = body.display_name !== undefined ? body.display_name.trim() : user.display_name;
+  const bio = body.bio !== undefined ? body.bio.toString() : user.bio;
+  const profilePictureUrl = body.profile_picture_url !== undefined ? body.profile_picture_url : user.profile_picture_url;
+
+  if (!displayName) return json({ error: "display_name cannot be empty" }, 400, cors);
+
+  await env.DB.prepare(
+    `UPDATE users SET display_name = ?, bio = ?, profile_picture_url = ? WHERE id = ?`
+  ).bind(displayName, bio, profilePictureUrl, user.id).run();
+
+  return json({ id: user.id, email: user.email, display_name: displayName, bio, profile_picture_url: profilePictureUrl }, 200, cors);
 }
 
 function json(obj, status, cors) {
