@@ -135,6 +135,11 @@ async function handleSignup(request, env, cors) {
   const displayName = (body.display_name || "").trim();
   if (!email || !password || !displayName) return json({ error: "email, password, and display_name are required" }, 400, cors);
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return json({ error: "Please use a valid email address" }, 400, cors);
+
+  const emailDomain = email.split("@")[1];
+  const domainReal = await domainCanReceiveEmail(emailDomain);
+  if (!domainReal) return json({ error: "That email domain doesn't appear to be able to receive mail. Please use a real email address." }, 400, cors);
+
   if (password.length < 8) return json({ error: "password must be at least 8 characters" }, 400, cors);
 
   const existing = await env.DB.prepare(`SELECT id FROM users WHERE email = ?`).bind(email).first();
@@ -782,6 +787,30 @@ async function markAllNotificationsRead(request, env, cors) {
   if (!user) return json({ error: "Unauthorized" }, 401, cors);
   await env.DB.prepare(`UPDATE notifications SET is_read=1 WHERE user_id=?`).bind(user.id).run();
   return json({ ok: true }, 200, cors);
+}
+
+async function domainCanReceiveEmail(domain) {
+  try {
+    const mxRes = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=MX`, {
+      headers: { Accept: "application/dns-json" },
+    });
+    if (mxRes.ok) {
+      const mxData = await mxRes.json();
+      if (mxData.Answer && mxData.Answer.length > 0) return true;
+    }
+    // A handful of domains accept mail via a bare A/AAAA record instead of MX.
+    const aRes = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=A`, {
+      headers: { Accept: "application/dns-json" },
+    });
+    if (aRes.ok) {
+      const aData = await aRes.json();
+      if (aData.Answer && aData.Answer.length > 0) return true;
+    }
+    return false;
+  } catch (_) {
+    // Don't block signup if the DNS check itself fails (network hiccup).
+    return true;
+  }
 }
 
 function json(obj, status, cors) {
