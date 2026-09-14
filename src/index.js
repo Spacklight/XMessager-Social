@@ -45,6 +45,7 @@ export default {
       if (p === "/api/auth/login" && request.method === "POST") return await handleLogin(request, env, cors);
       if (p === "/api/me" && request.method === "GET") return await handleMe(request, env, cors);
       if (p === "/api/me" && request.method === "POST") return await handleUpdateMe(request, env, cors);
+      if (p === "/api/auth/google" && request.method === "POST") return await handleGoogleAuth(request, env, cors);
 
       if (p === "/api/users/search" && request.method === "GET") return await searchUser(request, env, cors);
       let mm = m(/^\/api\/users\/([a-f0-9-]+)$/);
@@ -811,6 +812,88 @@ async function domainCanReceiveEmail(domain) {
     // Don't block signup if the DNS check itself fails (network hiccup).
     return true;
   }
+}
+
+const FIREBASE_PROJECT_ID = "registerapp-68127";
+
+function base64UrlDecode(str) {
+  str = str.replace(/-/g, "+").replace(/_/g, "/");
+  while (str.length % 4) str += "=";
+  const bin = atob(str);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+function base64UrlDecodeToString(str) {
+  return new TextDecoder().decode(base64UrlDecode(str));
+}
+
+// Fully verifies a Firebase ID token server-side: checks issuer, audience,
+// expiry, and the RS256 signature against Google's published public keys.
+// This is what actually confirms the person owns the Google account —
+// never trust a token's claims without verifying its signature first.
+async function verifyFirebaseIdToken(idToken) {
+  const parts = idToken.split(".");
+  if (parts.length !== 3) throw new Error("Malformed token");
+  const [headerB64, payloadB64, sigB64] = parts;
+  const header = JSON.parse(base64UrlDecodeToString(headerB64));
+  const payload = JSON.parse(base64UrlDecodeToString(payloadB64));
+
+  if (payload.iss !== `https://securetoken.google.com/${FIREBASE_PROJECT_ID}`) throw new Error("Invalid issuer");
+  if (payload.aud !== FIREBASE_PROJECT_ID) throw new Error("Invalid audience");
+  const now = Math.floor(Date.now() / 1000);
+  if (payload.exp < now) throw new Error("Token expired");
+  if (!payload.sub) throw new Error("Missing subject");
+
+  const jwksRes = await fetch("https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com");
+  if (!jwksRes.ok) throw new Error("Could not fetch verification keys");
+  const jwks = await jwksRes.json();
+  const jwk = jwks.keys.find((k) => k.kid === header.kid);
+  if (!jwk) throw new Error("Unknown signing key");
+
+  const cryptoKey = await crypto.subtle.importKey("jwk", jwk, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]);
+  const signingInput = new TextEncoder().encode(`${headerB64}.${payloadB64}`);
+  const signature = base64UrlDecode(sigB64);
+  const valid = await crypto.subtle.verify("RSASSA-PKCS1-v1_5", cryptoKey, signature, signingInput);
+  if (!valid) throw new Error("Invalid signature");
+
+  return payload;
+}
+
+async function handleGoogleAuth(request, env, cors) {
+  const body = await request.json();
+  const idToken = body.id_token;
+  if (!idToken) return json({ error: "id_token is required" }, 400, cors);
+
+  let claims;
+  try {
+    claims = await verifyFirebaseIdToken(idToken);
+  } catch (err) {
+    return json({ error: "Could not verify Google sign-in" }, 401, cors);
+  }
+
+  const email = (claims.email || "").toLowerCase();
+  if (!email) return json({ error: "Your Google account has no email" }, 400, cors);
+  const displayName = claims.name || email.split("@")[0];
+  const pictureUrl = claims.picture || null;
+  const loc = getLocation(request);
+
+  let user = await env.DB.prepare(`SELECT * FROM users WHERE email = ?`).bind(email).first();
+  if (!user) {
+    const placeholder = bytesToHex(crypto.getRandomValues(new Uint8Array(32)));
+    const id = crypto.randomUUID();
+    const createdAt = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO users (id,email,password_hash,password_salt,display_name,bio,profile_picture_url,continent,region,country,created_at,auth_provider)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`
+    ).bind(id, email, placeholder, placeholder, displayName, "", pictureUrl, loc.continent, loc.region, loc.country, createdAt, "google").run();
+    user = { id, email, display_name: displayName, bio: "", profile_picture_url: pictureUrl };
+  } else if (user.auth_provider !== "google") {
+    await env.DB.prepare(`UPDATE users SET auth_provider = 'google' WHERE id = ?`).bind(user.id).run();
+  }
+
+  const token = await createSession(env, user.id);
+  return json({ token, user: { id: user.id, email: user.email, display_name: user.display_name, bio: user.bio, profile_picture_url: user.profile_picture_url } }, 200, cors);
 }
 
 function json(obj, status, cors) {
